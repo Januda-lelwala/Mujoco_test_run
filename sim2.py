@@ -1,18 +1,55 @@
-# import sys
-# import os
-# import subprocess
+import sys
+import os
+import subprocess
 
-# # On macOS, launch_passive requires mjpython. Re-launch under it if needed.
-# if sys.platform == "darwin" and os.path.basename(sys.executable) != "mjpython":
-#     mjpython = os.path.join(os.path.dirname(sys.executable), "mjpython")
-#     sys.exit(subprocess.call([mjpython, __file__] + sys.argv[1:]))
+# On macOS, launch_passive requires mjpython. Re-launch under it if needed.
+# Use an env-var sentinel so we don't re-launch infinitely.
+if sys.platform == "darwin" and os.environ.get("_MJPYTHON_RELAUNCHED") != "1":
+    mjpython = os.path.join(os.path.dirname(sys.executable), "mjpython")
+    env = os.environ.copy()
+    env["_MJPYTHON_RELAUNCHED"] = "1"
+    sys.exit(subprocess.call([mjpython, __file__] + sys.argv[1:], env=env))
 
+import time
+import numpy as np
 import mujoco
 import mujoco.viewer
+from robot_descriptions import panda_mj_description
 
-# Loading a specific model description as an imported module.
-from robot_descriptions import g1_description
-m = mujoco.MjModel.from_xml_path(g1_description.URDF_PATH)
+# Load model
+m = mujoco.MjModel.from_xml_path(panda_mj_description.MJCF_PATH)
 d = mujoco.MjData(m)
 
-mujoco.viewer.launch(m, d)
+# --- Actuator control demo ---
+# The Panda has 8 actuators:
+#   [0-6]  arm joints  (position-controlled, sinusoidal motion)
+#   [7]    gripper     (kept half-open)
+
+AMPLITUDE = 0.4   # radians
+FREQUENCY = 0.3   # Hz — how fast joints oscillate
+
+# Each joint gets a different phase so the motion looks interesting
+PHASES = [i * (np.pi / 4) for i in range(7)]
+
+def set_ctrl(data, t):
+    for i in range(7):
+        lo, hi = m.actuator_ctrlrange[i]
+        mid = (lo + hi) / 2
+        data.ctrl[i] = mid + AMPLITUDE * np.sin(2 * np.pi * FREQUENCY * t + PHASES[i])
+    data.ctrl[7] = 100  # gripper half-open (range 0-255)
+
+with mujoco.viewer.launch_passive(m, d) as viewer:
+    start = time.time()
+    while viewer.is_running():
+        step_start = time.time()
+
+        set_ctrl(d, d.time)       # apply control signals
+        mujoco.mj_step(m, d)      # step physics
+
+        viewer.sync()
+
+        # Pace simulation to real time
+        elapsed = time.time() - step_start
+        remaining = m.opt.timestep - elapsed
+        if remaining > 0:
+            time.sleep(remaining)

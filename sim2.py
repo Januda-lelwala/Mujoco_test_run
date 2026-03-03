@@ -14,29 +14,25 @@ import time
 import numpy as np
 import mujoco
 import mujoco.viewer
-from robot_descriptions import panda_mj_description
+from robot_descriptions import mujoco_humanoid_mj_description
 
 # Load model
-m = mujoco.MjModel.from_xml_path(panda_mj_description.MJCF_PATH)
+m = mujoco.MjModel.from_xml_path(mujoco_humanoid_mj_description.MJCF_PATH)
 d = mujoco.MjData(m)
 
 # --- Actuator control demo ---
-# The Panda has 8 actuators:
-#   [0-6]  arm joints  (position-controlled, sinusoidal motion)
-#   [7]    gripper     (kept half-open)
+# Sinusoidal motion on all joints, each with a different phase.
 
-AMPLITUDE = 0.4   # radians
-FREQUENCY = 0.3   # Hz — how fast joints oscillate
+AMPLITUDE = 0.3   # radians
+FREQUENCY = 0.3   # Hz
 
-# Each joint gets a different phase so the motion looks interesting
-PHASES = [i * (np.pi / 4) for i in range(7)]
+PHASES = [i * (np.pi / m.nu) for i in range(m.nu)]
 
 def set_ctrl(data, t):
-    for i in range(7):
+    for i in range(m.nu):
         lo, hi = m.actuator_ctrlrange[i]
         mid = (lo + hi) / 2
         data.ctrl[i] = mid + AMPLITUDE * np.sin(2 * np.pi * FREQUENCY * t + PHASES[i])
-    data.ctrl[7] = 100  # gripper half-open (range 0-255)
 
 with mujoco.viewer.launch_passive(m, d) as viewer:
     start = time.time()

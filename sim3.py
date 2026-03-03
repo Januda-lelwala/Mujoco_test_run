@@ -26,10 +26,10 @@ import torch.optim as optim
 m = mujoco.MjModel.from_xml_path(mujoco_humanoid_mj_description.MJCF_PATH)
 d = mujoco.MjData(m)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")   
+device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
 
-actorcritic=ActorCritic(m.nq, m.nu)
-ppo=PPO(m.nq, m.nu)
+actorcritic = ActorCritic(m.nq, m.nu).to(device)
+ppo = PPO(m.nq, m.nu)
 
 
 
@@ -44,6 +44,7 @@ viewer = mujoco.viewer.launch_passive(m, d)
 for update in range(max_updates):
     states = []
     actions = []
+    log_probs = []
     rewards = []
     dones = []
     values = []
@@ -58,7 +59,7 @@ for update in range(max_updates):
 
         d.ctrl[:] = 0.0
         for i in range(m.nu):
-            d.ctrl[i] = action[i].item() * 2 - 1  # Scale to [-1, 1]
+            d.ctrl[i] = action_probs[i].item() * 2 - 1  # Scale to [-1, 1]
 
         mujoco.mj_step(m, d)
 
@@ -72,9 +73,12 @@ for update in range(max_updates):
 
         states.append(state)
         actions.append(action)
+        log_probs.append(log_prob)
         rewards.append(reward)
         dones.append(done)
         values.append(state_value)
+        viewer.sync()
 
     # Compute advantages and returns, then update policy with PPO
-    ppo.update(states, actions, rewards, dones, values)
+    ppo.update(states, actions, log_probs, rewards, dones, values)
+    print(f"Update {update + 1}/{max_updates} completed.")

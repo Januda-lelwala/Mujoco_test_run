@@ -3,12 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-device = torch.device("cuda")
+device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
 
-class ActorCritic:
+class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim):
+        super().__init__()
         self.actor = Actor(state_dim, action_dim)
-        self.critic = Critic(state_dim) 
+        self.critic = Critic(state_dim)
 
     def forward(self, state):
         action_probs = self.actor(state)
@@ -73,22 +74,37 @@ class PPO:
         return action.item(), log_prob.item(), value.item()
 
     def update(self, states, actions, log_probs_old, rewards, dones, values):
-        # Compute advantages and returns
-        advantages = self.compute_gae(rewards, values, dones)
-        returns = [adv + val for adv, val in zip(advantages, values)]
+        # Normalize values to Python scalars for GAE computation
+        vals_scalar = [v.item() if isinstance(v, torch.Tensor) else float(v) for v in values]
 
-        # Convert to tensors
-        states      = torch.FloatTensor(states).to(device)
-        actions     = torch.LongTensor(actions).to(device)
-        log_probs_old = torch.FloatTensor(log_probs_old).to(device)
-        returns     = torch.FloatTensor(returns).to(device)
-        advantages  = torch.FloatTensor(advantages).to(device)
+        # Compute advantages and returns
+        advantages = self.compute_gae(rewards, vals_scalar, dones)
+        returns = [adv + val for adv, val in zip(advantages, vals_scalar)]
+
+        # Convert to tensors on device (handle both pre-built tensors and raw lists)
+        if isinstance(states[0], torch.Tensor):
+            states = torch.stack(states).to(device)
+        else:
+            states = torch.FloatTensor(states).to(device)
+
+        if isinstance(actions[0], torch.Tensor):
+            actions = torch.stack(actions).detach().long().to(device)
+        else:
+            actions = torch.LongTensor(actions).to(device)
+
+        if isinstance(log_probs_old[0], torch.Tensor):
+            log_probs_old = torch.stack(log_probs_old).detach().to(device)
+        else:
+            log_probs_old = torch.FloatTensor(log_probs_old).to(device)
+
+        returns     = torch.tensor(returns, dtype=torch.float32, device=device)
+        advantages  = torch.tensor(advantages, dtype=torch.float32, device=device)
         advantages  = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         dataset_size = len(states)
         for _ in range(self.epochs):
             # Shuffle indices for mini-batch updates
-            indices = torch.randperm(dataset_size)
+            indices = torch.randperm(dataset_size, device=device)
             for start in range(0, dataset_size, self.batch_size):
                 batch_idx = indices[start: start + self.batch_size]
 

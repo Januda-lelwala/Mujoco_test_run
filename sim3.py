@@ -15,11 +15,8 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 from robot_descriptions import mujoco_humanoid_mj_description
-from rl import ActorCritic, PPO
+from rl import PPO
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 
 
 # Load model
@@ -28,16 +25,19 @@ d = mujoco.MjData(m)
 
 device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
 
-actorcritic = ActorCritic(m.nq, m.nu).to(device)
-ppo = PPO(m.nq, m.nu)
+# state = qpos + qvel; use a single network owned by PPO
+state_dim = m.nq + m.nv
+ppo = PPO(state_dim, m.nu)
 
-
+if os.path.exists("ppo_humanoid_update.pth"):
+    ppo.load("ppo_humanoid_update.pth")
+ppo.policy.to(device)
 
 # =============================
 # Training Loop
 # =============================
 steps_per_rollout = 2048
-max_updates = 1000
+max_updates = 5000  # ~10M steps — minimum to see real progress on humanoid
 
 viewer = mujoco.viewer.launch_passive(m, d)
 
@@ -50,35 +50,63 @@ for update in range(max_updates):
     values = []
 
     for step in range(steps_per_rollout):
-        state = torch.tensor(d.qpos, dtype=torch.float32).to(device)
-        action_probs, state_value = actorcritic(state)
+        raw_obs = np.concatenate([d.qpos, d.qvel])
+        state = torch.tensor(
+            ppo.normalize_obs(raw_obs), dtype=torch.float32
+        ).to(device)
 
-        action_dist = torch.distributions.Categorical(action_probs)
-        action = action_dist.sample()
-        log_prob = action_dist.log_prob(action)
+        with torch.no_grad():
+            action, log_prob, state_value = ppo.policy(state)
 
-        d.ctrl[:] = 0.0
-        for i in range(m.nu):
-            d.ctrl[i] = action_probs[i].item() * 2 - 1  # Scale to [-1, 1]
+        # Tanh squashes raw action to [-1, 1] matching actuator range
+        ctrl = torch.tanh(action).cpu().numpy()
+        d.ctrl[:] = ctrl
 
         mujoco.mj_step(m, d)
 
-        # Walking reward
+        # --- NaN guard: unstable sim poisons gradients, reset immediately ---
+        if not np.isfinite(d.qpos).all() or not np.isfinite(d.qvel).all():
+            mujoco.mj_resetData(m, d)
+            rewards.append(0.0)
+            dones.append(1.0)
+            states.append(state)
+            actions.append(action)
+            log_probs.append(log_prob)
+            values.append(state_value.squeeze())
+            viewer.sync()
+            continue
+
+        # Walking reward — alive gates everything so standing comes first
         forward_vel = d.qvel[0]                              # reward forward (x) velocity
         height = d.qpos[2]                                   # torso height
-        alive = 1.0 if 0.8 < height < 2.1 else 0.0          # bonus for staying upright
+        is_alive = 0.8 < height < 2.1
+        alive_bonus = 5.0 if is_alive else 0.0               # strong incentive to stay upright
         ctrl_cost = 0.001 * np.sum(np.square(d.ctrl))        # penalty for large actuations
-        reward = forward_vel + alive - ctrl_cost
-        done = height < 0.8 or height > 2.1                  # episode ends if humanoid falls
+        # forward_vel only counts when alive, preventing reward from tumbling forward
+        reward = alive_bonus + (forward_vel if is_alive else 0.0) - ctrl_cost
+        done = not is_alive                                  # episode ends if humanoid falls
 
         states.append(state)
         actions.append(action)
         log_probs.append(log_prob)
         rewards.append(reward)
-        dones.append(done)
-        values.append(state_value)
+        dones.append(float(done))
+        values.append(state_value.squeeze())
         viewer.sync()
+
+        if done:
+            mujoco.mj_resetData(m, d)                        # reset sim on episode end
 
     # Compute advantages and returns, then update policy with PPO
     ppo.update(states, actions, log_probs, rewards, dones, values)
-    print(f"Update {update + 1}/{max_updates} completed.")
+    ppo.save("ppo_humanoid_update.pth")
+
+    total_reward = sum(rewards)
+    mean_reward = total_reward / len(rewards)
+    max_reward = max(rewards)
+    episodes = int(sum(dones))
+    print(f"[Update {update + 1:>4}/{max_updates}]  "
+          f"mean_r={mean_reward:+.3f}  "
+          f"total_r={total_reward:+.1f}  "
+          f"max_r={max_reward:+.3f}  "
+          f"episodes={episodes}")
